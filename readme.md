@@ -364,7 +364,7 @@ SELECT * FROM delta.`/Volumes/databricks_streaming/stream/streaming/jsonsink/Dat
 
 ### 4.4 Archiving Source Files
 
-`spark.readStream` does **not** maintain a checkpoint for "which files have been processed" the way Auto Loader does. To avoid reprocessing the same file on subsequent runs, source files must be **moved out** after processing. This is called **archiving**.
+`spark.readStream` does **not** maintain a checkpoint for "which files have been processed" the way Auto Loader does. To avoid reprocessing files on subsequent runs, source files are **moved out** after processing. This is called **archiving**.
 
 #### Directory Layout
 
@@ -381,9 +381,9 @@ df = (spark.readStream
   .format("json")
   .option("multiLine", True)
   .schema(my_schema)
-  .option("cleanSource", "archive")                            # move instead of delete
-  .option("sourceArchiveDir", "/Volumes/.../jsonsourcearchive")  # archive target
-  .load("/Volumes/.../jsonsourcenew")                          # input path
+  .option("cleanSource", "archive")
+  .option("sourceArchiveDir", "/Volumes/.../jsonsourcearchive")
+  .load("/Volumes/.../jsonsourcenew")
 )
 
 df.writeStream \
@@ -400,49 +400,41 @@ df.writeStream \
 | `cleanSource` | `"archive"` | After processing, move source files to the archive directory |
 | `sourceArchiveDir` | `.../jsonsourcearchive` | Target directory for archived files |
 
-#### Behavior: "Only When Processing"
+#### Observed Behavior (step-by-step)
 
-Archiving is triggered **only for files that were actually processed**:
+| Step | Action | After Run: `jsonsourcenew/` | After Run: `jsonsourcearchive/` | After Run: `jsonsinknew/Data` |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | Upload `day1`, run | day1 (not archived) | (empty) | day1 data |
+| 2 | Upload `day2`, run | day2 | day1 | day1 + day2 data |
+| 3 | Re-upload `day1`, run | day1, day2 | day1 | day1 + day2 data (with duplicates) |
+| 4 | Upload `day3`, run | day1, day3 | day1, day2 | day1 + day2 + day3 data |
+| 5 | Run again (no new file) | day1, day3 | day1, day2 | (unchanged) |
 
-1. Place files into `jsonsourcenew/`.
-2. Run `readStream` → files are read and processed.
-3. Processed files are **moved** from `jsonsourcenew/` to `jsonsourcearchive/`.
-4. `jsonsourcenew/` becomes empty (or contains only unprocessed files).
-5. On the next run, only **new** files in `jsonsourcenew/` are processed.
+**Key observations:**
+- **The latest uploaded file stays in `jsonsourcenew/`** until the next new file arrives.
+- **The previous "latest" file is archived** when a newer file comes in.
+- **Re-uploading `day1`** produces duplicate rows in the output (checkpoint only tracks paths + timestamps, not content).
+- **Running again with no new file** does not change anything.
 
-**Result:** No reprocessing of old files, no duplication in the output table.
+**Conclusion:** The archive mechanism follows a **"retain the latest, archive the rest"** pattern. The input directory is never fully emptied — it always holds the most recent file waiting for the next one.
 
-#### Verifying Archiving Works
+#### Idempotency Caveat
 
-After running, check the directories:
+`checkpointLocation` tracks **file paths and modification timestamps**, not file content. Re-uploading the same file changes its timestamp, so Spark treats it as **new** and processes it again — producing duplicate rows.
 
-```python
-display(dbutils.fs.ls("/Volumes/.../jsonsourcenew"))       # → empty (or only new files)
-display(dbutils.fs.ls("/Volumes/.../jsonsourcearchive"))   # → contains processed files
-```
+| Requirement | Guaranteed? |
+| :--- | :--- |
+| No reprocessing of the same file path + timestamp | ✅ |
+| No duplication when the same content is re-uploaded | ❌ |
 
-| Directory | Before Run | After Run |
-| :--- | :--- | :--- |
-| `jsonsourcenew/` | day1.json, day2.json | empty |
-| `jsonsourcearchive/` | empty | day1.json, day2.json |
-
-#### Files That Remain in `jsonsourcenew/`
-
-After a successful run, files can remain in `jsonsourcenew/` in two cases:
-
-| Case | Reason | Action |
-| :--- | :--- | :--- |
-| **Not yet processed** | New file uploaded but `readStream` hasn't run | Run the stream again |
-| **Archiving failed** | `sourceArchiveDir` write failed (permissions, path) | Check archive directory and logs |
-
-**Important:** Even if a processed file remains in `jsonsourcenew/`, it will **not** be reprocessed — the `checkpointLocation` tracks which files have already been handled.
+To achieve true idempotency, deduplication must be handled at the write layer (e.g., `dropDuplicates()` or `MERGE`).
 
 #### Comparison: Archive vs. Auto Loader
 
-| Approach | Prevents Reprocessing? | Schema Evolution? |
-| :--- | :--- | :--- |
-| `readStream` + archive | ✅ (files moved out) | ❌ |
-| Auto Loader (`cloudFiles`) | ✅ (checkpoint tracks files) | ✅ |
+| Approach | Prevents Reprocessing? | Schema Evolution? | Retains Latest File? |
+| :--- | :--- | :--- | :--- |
+| `readStream` + archive | ✅ (via file movement) | ❌ | ✅ |
+| Auto Loader (`cloudFiles`) | ✅ (via checkpoint) | ✅ | ❌ |
 
 Auto Loader is the recommended modern approach. The archive pattern is shown here for completeness, since some legacy pipelines use it.
 
