@@ -418,17 +418,6 @@ df.writeStream \
 
 **Conclusion:** The archive mechanism follows a **"retain the latest, archive the rest"** pattern. The input directory is never fully emptied — it always holds the most recent file waiting for the next one.
 
-#### Idempotency Caveat
-
-`checkpointLocation` tracks **file paths and modification timestamps**, not file content. Re-uploading the same file changes its timestamp, so Spark treats it as **new** and processes it again — producing duplicate rows.
-
-| Requirement | Guaranteed? |
-| :--- | :--- |
-| No reprocessing of the same file path + timestamp | ✅ |
-| No duplication when the same content is re-uploaded | ❌ |
-
-To achieve true idempotency, deduplication must be handled at the write layer (e.g., `dropDuplicates()` or `MERGE`).
-
 #### Comparison: Archive vs. Auto Loader
 
 | Approach | Prevents Reprocessing? | Schema Evolution? | Retains Latest File? |
