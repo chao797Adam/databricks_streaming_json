@@ -362,6 +362,90 @@ Query the output:
 SELECT * FROM delta.`/Volumes/databricks_streaming/stream/streaming/jsonsink/Data` LIMIT 10;
 ```
 
+### 4.4 Archiving Source Files
+
+`spark.readStream` does **not** maintain a checkpoint for "which files have been processed" the way Auto Loader does. To avoid reprocessing the same file on subsequent runs, source files must be **moved out** after processing. This is called **archiving**.
+
+#### Directory Layout
+
+| Directory | Role |
+| :--- | :--- |
+| `jsonsourcenew/` | **Input** — files to be read by `readStream` |
+| `jsonsourcearchive/` | **Archive** — processed files are moved here |
+| `jsonsinknew/Data/` | **Output** — Delta table written by `writeStream` |
+
+#### Code
+
+```python
+df = (spark.readStream
+  .format("json")
+  .option("multiLine", True)
+  .schema(my_schema)
+  .option("cleanSource", "archive")                            # move instead of delete
+  .option("sourceArchiveDir", "/Volumes/.../jsonsourcearchive")  # archive target
+  .load("/Volumes/.../jsonsourcenew")                          # input path
+)
+
+df.writeStream \
+  .format("delta") \
+  .outputMode("append") \
+  .trigger(once=True) \
+  .option("path", "/Volumes/.../jsonsinknew/Data") \
+  .option("checkpointLocation", "/Volumes/.../jsonsinknew/checkpoint") \
+  .start()
+```
+
+| Option | Value | Purpose |
+| :--- | :--- | :--- |
+| `cleanSource` | `"archive"` | After processing, move source files to the archive directory |
+| `sourceArchiveDir` | `.../jsonsourcearchive` | Target directory for archived files |
+
+#### Behavior: "Only When Processing"
+
+Archiving is triggered **only for files that were actually processed**:
+
+1. Place files into `jsonsourcenew/`.
+2. Run `readStream` → files are read and processed.
+3. Processed files are **moved** from `jsonsourcenew/` to `jsonsourcearchive/`.
+4. `jsonsourcenew/` becomes empty (or contains only unprocessed files).
+5. On the next run, only **new** files in `jsonsourcenew/` are processed.
+
+**Result:** No reprocessing of old files, no duplication in the output table.
+
+#### Verifying Archiving Works
+
+After running, check the directories:
+
+```python
+display(dbutils.fs.ls("/Volumes/.../jsonsourcenew"))       # → empty (or only new files)
+display(dbutils.fs.ls("/Volumes/.../jsonsourcearchive"))   # → contains processed files
+```
+
+| Directory | Before Run | After Run |
+| :--- | :--- | :--- |
+| `jsonsourcenew/` | day1.json, day2.json | empty |
+| `jsonsourcearchive/` | empty | day1.json, day2.json |
+
+#### Files That Remain in `jsonsourcenew/`
+
+After a successful run, files can remain in `jsonsourcenew/` in two cases:
+
+| Case | Reason | Action |
+| :--- | :--- | :--- |
+| **Not yet processed** | New file uploaded but `readStream` hasn't run | Run the stream again |
+| **Archiving failed** | `sourceArchiveDir` write failed (permissions, path) | Check archive directory and logs |
+
+**Important:** Even if a processed file remains in `jsonsourcenew/`, it will **not** be reprocessed — the `checkpointLocation` tracks which files have already been handled.
+
+#### Comparison: Archive vs. Auto Loader
+
+| Approach | Prevents Reprocessing? | Schema Evolution? |
+| :--- | :--- | :--- |
+| `readStream` + archive | ✅ (files moved out) | ❌ |
+| Auto Loader (`cloudFiles`) | ✅ (checkpoint tracks files) | ✅ |
+
+Auto Loader is the recommended modern approach. The archive pattern is shown here for completeness, since some legacy pipelines use it.
+
 ---
 
 ## 5. Observation: Row Multiplication from Multiple Explodes
