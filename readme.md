@@ -427,6 +427,108 @@ df.writeStream \
 
 Auto Loader is the recommended modern approach. The archive pattern is shown here for completeness, since some legacy pipelines use it.
 
+### 4.5 Output Modes
+
+`outputMode` controls how a streaming DataFrame writes its results to the sink.
+
+| Mode | Output Behavior | Destination State |
+| :--- | :--- | :--- |
+| `append` | Only new rows are written. No updates or overwrites. | Grows over time; no updates |
+| `update` | Only rows whose values changed in the latest batch are written. | Same final state as `complete` |
+| `complete` | The **entire result set** is rewritten on every batch. | Same final state as `update` |
+
+**Key distinction:**
+- `update` and `complete` produce the **same final destination state**.
+- The difference is **what gets written per batch**:
+  - `complete` → rewrites the entire result set each time.
+  - `update` → writes only the rows that changed in the latest batch.
+
+**Note:** Aggregations (`groupBy`) cannot use `append` mode — they must use `update` or `complete`.
+
+#### Creating the Source Table
+
+A small table is used as the streaming source:
+
+```sql
+CREATE TABLE IF NOT EXISTS databricks_streaming.stream.sourcetable (
+    color STRING
+);
+
+INSERT INTO databricks_streaming.stream.sourcetable VALUES
+    ('red'),
+    ('green'),
+    ('blue'),
+    ('yellow'),
+    ('orange'),
+    ('orange');
+```
+
+#### Running with `complete` Mode
+
+The aggregation groups by `color` and counts occurrences:
+
+```python
+df = spark.readStream.table("databricks_streaming.stream.sourcetable")
+
+df = df.groupBy("color").agg(count("*").alias("count"))
+
+df.writeStream.format("delta") \
+    .outputMode("complete") \
+    .trigger(once=True) \
+    .option("checkpointLocation", "/Volumes/databricks_streaming/stream/streaming/output/check") \
+    .option("path", "/Volumes/databricks_streaming/stream/streaming/output/Data") \
+    .start()
+```
+
+#### Simulating Multiple Batches
+
+To observe how `complete` mode behaves, three insert batches were applied:
+
+| Batch | Inserted | After Run: Aggregated Result |
+| :--- | :--- | :--- |
+| 1 | red, green, blue, yellow, orange, orange | red:2, green:2, blue:2, yellow:1, orange:2 |
+| 2 | red, green, blue | red:2, green:2, blue:2, yellow:1, orange:2 |
+| 3 | maroon | red:2, green:2, blue:2, yellow:1, orange:2, maroon:1 |
+
+#### Observed Result
+
+```sql
+SELECT * FROM delta.`/Volumes/databricks_streaming/stream/streaming/output/Data`;
+```
+
+| color | count |
+| :--- | :--- |
+| yellow | 1 |
+| orange | 2 |
+| maroon | 1 |
+| green | 2 |
+| blue | 2 |
+| red | 2 |
+
+The output reflects the **full aggregated state** of the source table — confirming `complete` mode behavior.
+
+#### Note: `update` Mode Not Available in Free Edition
+
+The tutorial also demonstrates `update` mode, but **Databricks Free Edition does not support it**.
+
+If it were available:
+- **`update` and `complete` would produce the same final destination state.**
+- The difference is **what gets written during each batch**:
+  - `complete` → rewrites the entire result set every time.
+  - `update` → writes only the rows whose values changed in the latest batch.
+
+In the final run (inserting `maroon`):
+- `complete` output: the full table (`red:2, green:2, blue:2, yellow:1, orange:2, maroon:1`).
+- `update` output (hypothetical): only `maroon:1` — the row that changed.
+
+#### Summary
+
+| Mode | Final Destination | Per-Batch Output |
+| :--- | :--- | :--- |
+| `append` | Grows over time | New rows only |
+| `update` | Full aggregated state | Only changed rows |
+| `complete` | Full aggregated state | Entire result set (rewritten) |
+
 ---
 
 ## 5. Observation: Row Multiplication from Multiple Explodes
