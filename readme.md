@@ -529,6 +529,78 @@ In the final run (inserting `maroon`):
 | `update` | Full aggregated state | Only changed rows |
 | `complete` | Full aggregated state | Entire result set (rewritten) |
 
+### 4.6 foreachBatch: Multiple Sinks from One Stream
+
+`foreachBatch` allows custom logic to be applied to each micro-batch of a streaming DataFrame. It is commonly used to:
+- Write to **multiple sinks** in one pass.
+- Perform operations not supported by native streaming sinks (e.g., `MERGE`, `upsert`).
+- Apply custom Python logic per batch.
+
+#### Full Code
+
+```python
+# 1. Define the per-batch function
+def myfunc(df, batch_id):
+    df = df.groupBy("color").agg(count("*").alias("count"))
+
+    # Destination 1
+    df.write.format("delta").mode("append") \
+        .option("path", ".../foreachsink/dest1").save()
+
+    # Destination 2
+    df.write.format("delta").mode("append") \
+        .option("path", ".../foreachsink/dest2").save()
+
+
+# 2. Start the stream, calling myfunc per batch
+df.writeStream.foreachBatch(myfunc) \
+    .outputMode("append") \
+    .trigger(once=True) \
+    .option("checkpointLocation", ".../foreachsink/checkpoint") \
+    .start()
+```
+
+#### Key Points
+
+| Element | Purpose |
+| :--- | :--- |
+| `myfunc(df, batch_id)` | Custom logic for each batch |
+| `df` | The current micro-batch (not the full stream) |
+| `batch_id` | Batch sequence number (0, 1, 2, ...) |
+| `foreachBatch(myfunc)` | Applies `myfunc` to each batch |
+| `outputMode("append")` | How the outer stream feeds batches |
+| `checkpointLocation` | Required — stores stream progress |
+
+#### Why Not Just Use `writeStream` Directly?
+
+A single `writeStream` writes to **only one sink**. To write the same data to multiple destinations, use `foreachBatch`:
+
+| Approach | Number of Sinks |
+| :--- | :--- |
+| `writeStream.format("delta").option("path", "sink1").start()` | 1 |
+| `foreachBatch` with multiple `.write` calls | 2+ |
+
+#### Note: Same Content in Both Sinks (by Design)
+
+In the tutorial, `dest1` and `dest2` receive identical content because both are written from the same `df`. This is intentional for demonstration — the goal is to show that `foreachBatch` can write to **multiple sinks in one pass**.
+
+In production, the two sinks typically differ:
+- **Hot vs. cold**: Delta (for BI) + Parquet (for archival)
+- **Detail vs. aggregate**: full records + aggregated summary
+- **Different systems**: Delta + Kafka / JDBC / external APIs
+
+Example: writing a detail table and an aggregated summary:
+
+```python
+def myfunc(df, batch_id):
+    # dest1: full detail
+    df.write.format("delta").mode("append").option("path", ".../dest1").save()
+
+    # dest2: aggregated summary
+    df.groupBy("color").agg(count("*").alias("count")) \
+        .write.format("delta").mode("append").option("path", ".../dest2").save()
+```
+
 ---
 
 ## 5. Observation: Row Multiplication from Multiple Explodes
