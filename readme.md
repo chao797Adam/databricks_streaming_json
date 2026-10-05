@@ -517,6 +517,34 @@ The `window` column is a struct with `start` and `end` fields.
 
 Real-world data rarely arrives in order. Structured Streaming uses **Watermarks** to handle out-of-order data — a threshold that determines when a window can be closed.
 
+#### Watermark: Handling Late Data
+
+Real-world data rarely arrives in Event Time order. Network delays, retries, or upstream buffering can cause an event with timestamp `11:07` to arrive at `11:15`. Without a mechanism to handle this, streaming windows would need to wait indefinitely for late data.
+
+A **Watermark** is a time threshold that tells Spark when it can safely stop waiting for late events.
+
+**How it works:**
+- Spark tracks the maximum Event Time seen so far (e.g., `11:25`).
+- The Watermark is computed as `max_event_time - watermark_delay` (e.g., `11:25 - 5min = 11:20`).
+- Any event with a timestamp **earlier than the Watermark** is considered "too late" and is dropped or ignored.
+- Windows whose end time is **before the Watermark** are closed and their state is cleared.
+
+**Example (10-minute window, 5-minute watermark):**
+
+| Event Arrives | Event Time | Latest Event Time | Watermark | Window Status |
+| :--- | :--- | :--- | :--- | :--- |
+| Event 1 | 11:05 | 11:05 | 11:00 | 11:00–11:10 still open |
+| Event 2 | 11:15 | 11:15 | 11:10 | 11:00–11:10 still waiting |
+| Event 3 | 11:25 | 11:25 | 11:20 | 11:00–11:10 closed |
+| Event 4 | 11:08 | 11:25 | 11:20 | **Dropped** (too late) |
+
+**Key points:**
+- **Watermark ≠ a larger window.** It is a *delay tolerance*, not a time bucket.
+- **Window** decides which bucket an event belongs to.
+- **Watermark** decides when a bucket can be closed and its state cleared.
+
+**Not used in this project:** Since all streaming in this project runs with `trigger(once=True)` (batch-style), Watermark is not required. It becomes essential in continuous streaming pipelines that process late-arriving data.
+
 ## 2.5 Window Types
 
 | Type | Syntax | Overlap |
