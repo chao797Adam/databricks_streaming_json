@@ -603,7 +603,7 @@ def myfunc(df, batch_id):
 
 ### 4.7 Windowed Aggregation
 
-Streaming allows **time-windowed aggregations** using the `window()` function. This groups events into fixed time intervals (e.g., every 10 minutes) and aggregates them.
+Streaming supports **time-windowed aggregations** via the `window()` function. This groups events into fixed time intervals (e.g., every 10 minutes) and aggregates them per window.
 
 #### Creating the Source Table
 
@@ -612,12 +612,42 @@ CREATE TABLE IF NOT EXISTS databricks_streaming.stream.windowtbl (
     color STRING,
     event_date TIMESTAMP
 );
-
-INSERT INTO databricks_streaming.stream.windowtbl
-VALUES ('red', '2025-01-01T11:07:00.000+00:00');
 ```
 
-#### Windowed Aggregation
+#### Preparing Test Data (Three Batches)
+
+Events are inserted in three separate batches to simulate data arriving over time.
+
+**Batch 1:**
+```sql
+INSERT INTO databricks_streaming.stream.windowtbl
+VALUES
+    ('red',   '2025-01-01T11:01:00.000+00:00'),
+    ('green', '2025-01-01T11:01:00.000+00:00');
+```
+
+**Batch 2:**
+```sql
+INSERT INTO databricks_streaming.stream.windowtbl
+VALUES ('green', '2025-01-01T11:07:00.000+00:00');
+```
+
+**Batch 3:**
+```sql
+INSERT INTO databricks_streaming.stream.windowtbl
+VALUES ('green', '2025-01-01T11:12:00.000+00:00');
+```
+
+**Final contents of `windowtbl`:**
+
+| color | event_date |
+| :--- | :--- |
+| red | 2025-01-01 11:01:00 |
+| green | 2025-01-01 11:01:00 |
+| green | 2025-01-01 11:07:00 |
+| green | 2025-01-01 11:12:00 |
+
+#### Windowed Aggregation Code
 
 ```python
 from pyspark.sql.functions import window, count, lit
@@ -632,36 +662,62 @@ df = df.groupBy(
 df.writeStream.format("delta") \
     .outputMode("complete") \
     .trigger(once=True) \
-    .option("path", ".../windows/Data") \
-    .option("checkpointLocation", ".../windows/checkpoint") \
+    .option("path", "/Volumes/databricks_streaming/stream/streaming/windows/Data") \
+    .option("checkpointLocation", "/Volumes/databricks_streaming/stream/streaming/windows/checkpoint") \
     .start()
 ```
 
 #### How `window()` Works
 
-`window("event_date", "10 minutes")` splits the timeline into 10-minute buckets:
+`window("event_date", "10 minutes")` splits the timeline into 10-minute buckets. Each event is assigned to the bucket that contains its timestamp.
 
-| Window | Time Range | Events Included |
+| Window | Time Range | Events Inside |
 | :--- | :--- | :--- |
-| Window 1 | 11:00 – 11:10 | red (11:07) |
-| Window 2 | 11:10 – 11:20 | — |
-| Window 3 | 11:20 – 11:30 | — |
-
-Each event is assigned to the window that contains its timestamp. Aggregation (`count`) is then applied per window.
+| Window 1 | 11:00 – 11:10 | red (11:01), green (11:01), green (11:07) |
+| Window 2 | 11:10 – 11:20 | green (11:12) |
 
 #### Why `complete` Mode?
 
-Windowed aggregations produce results that change as time progresses. `complete` mode rewrites the full result set on each batch, ensuring the latest window state is always visible.
+Windowed aggregations produce results that change as new events arrive. `complete` mode rewrites the full result set on each batch, ensuring the latest window state is always visible.
 
-#### Result
+#### Observed Result
 
 ```sql
-SELECT * FROM delta.`.../windows/Data`;
+SELECT * FROM delta.`/Volumes/databricks_streaming/stream/streaming/windows/Data`;
 ```
 
 | color | window | color_count |
 | :--- | :--- | :--- |
+| green | 2025-01-01 11:10:00 – 11:20:00 | 1 |
+| green | 2025-01-01 11:00:00 – 11:10:00 | 2 |
 | red | 2025-01-01 11:00:00 – 11:10:00 | 1 |
+
+**Interpretation:**
+
+| Window | Events Inside | Aggregation |
+| :--- | :--- | :--- |
+| 11:00 – 11:10 | red (11:01), green (11:01), green (11:07) | red: 1, green: 2 |
+| 11:10 – 11:20 | green (11:12) | green: 1 |
+
+The `window` column is a **struct** with two fields: `start` and `end`. Together they identify the window each row belongs to.
+
+#### Event Time vs. Processing Time
+
+Windowed aggregations use **Event Time** (the timestamp inside the data), not **Processing Time** (when Spark processes the data).
+
+| Concept | Meaning | Example |
+| :--- | :--- | :--- |
+| **Event Time** | When the event actually happened | `2025-01-01 11:07` |
+| **Processing Time** | When Spark processed the event | `2025-01-01 11:15` (arrival time) |
+
+**Why Event Time Matters:**
+- Business questions are about **when things happened**, not when they arrived.
+- Example: "Sales in the 11:00–11:10 window" should include orders placed at 11:07, even if they arrive later.
+- Using Processing Time would incorrectly bucket late-arriving data into the wrong window.
+
+Real-world data rarely arrives in Event Time order. Network delays can cause an 11:07 event to arrive at 11:15. Structured Streaming handles this via **Watermarks** — a time threshold that decides when a window can be safely closed.
+
+**In this project:** `window("event_date", "10 minutes")` uses `event_date` (Event Time) to bucket events, ensuring business-correct aggregations.
 
 #### Summary
 
@@ -670,25 +726,8 @@ SELECT * FROM delta.`.../windows/Data`;
 | `window(col, duration)` | Split timeline into fixed intervals |
 | `groupBy("color", window(...))` | Aggregate per color per window |
 | `outputMode("complete")` | Rewrite the full window result each batch |
-
-#### Event Time vs. Processing Time
-
-In windowed aggregations, the time dimension is usually **Event Time** — the timestamp recorded inside the data — not **Processing Time** — when Spark processes it.
-
-| Concept | Meaning | Example |
-| :--- | :--- | :--- |
-| **Event Time** | When the event actually happened | `2025-01-01 11:07` (from `event_date`) |
-| **Processing Time** | When Spark processed the event | `2025-01-01 11:15` (arrival time) |
-
-**Why Event Time Matters:**
-- Business questions are about **when things happened**, not when they arrived.
-- Example: "Sales in the 11:00–11:10 window" should include orders placed at 11:07, even if they arrive late.
-- Using Processing Time would incorrectly bucket late-arriving data into the wrong window.
-
-**Out-of-order Data:**
-Real-world data rarely arrives in Event Time order. A network delay can cause an 11:07 event to arrive at 11:15. Structured Streaming handles this via **Watermarks** — a time threshold that decides when a window can be safely closed.
-
-**In this project:** `window("event_date", "10 minutes")` uses `event_date` (Event Time) to bucket events, ensuring the aggregation is business-correct.
+| `Event Time` | The timestamp inside the data (used for bucketing) |
+| `Processing Time` | The time Spark processes the data (not used for bucketing) |
 
 ---
 
