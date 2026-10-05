@@ -1,11 +1,15 @@
+# JSON Streaming with Databricks
 
-# JSON Ingestion & Flattening with Auto Loader
+This project covers two parts:
 
-This project ingests a nested JSON file representing **one order per record**, and flattens it into a Silver-layer table using Auto Loader and PySpark.
+- **Part 1:** Ingest and flatten nested JSON order data (day1 / day2 / day3).
+- **Part 2:** Demonstrate core streaming concepts (output modes, `foreachBatch`, windowing) using a small `color` dataset.
 
 ---
 
-## 1. Source Data: One Order per JSON Record
+# Part 1: JSON Order Ingestion
+
+## 1.1 Source Data: One Order per JSON Record
 
 The source is a nested JSON file. Each record represents **one order**.
 
@@ -49,13 +53,11 @@ The source is a nested JSON file. Each record represents **one order**.
 | `payment` | struct | 1-to-1 nested object |
 | `metadata` | array of struct | 1-to-many |
 
----
+## 1.2 Inspection Workflow
 
-## 2. Inspection Workflow (Step-by-Step)
+For nested JSON, do not write the whole transformation in one go. Inspect each step.
 
-For nested JSON, **do not write the whole transformation in one go**. Inspect each step.
-
-### Step 1: Batch read to infer structure
+### Batch read
 
 ```python
 df = (spark.read
@@ -66,7 +68,7 @@ df = (spark.read
 display(df)
 ```
 
-### Step 2: Print the inferred schema
+### Print schema
 
 ```python
 df.printSchema()
@@ -106,13 +108,11 @@ root
 - Structs (1-to-1): `customer`, `payment`
 - Arrays (1-to-many): `items`, `metadata`
 
----
+## 1.3 Generating the DDL for Streaming
 
-## 3. Generating the DDL for Streaming
+Streaming readers use an explicit schema.
 
-Streaming readers use an explicit schema to avoid repeated inference.
-
-### Method A: Reuse the inferred schema object
+### Reuse the inferred schema object
 
 ```python
 my_schema = df.schema
@@ -122,9 +122,9 @@ df_stream = spark.readStream.format("json") \
     .load("/Volumes/.../jsonsource")
 ```
 
-### Method B: Write a DDL string (for readability)
+### Or write a DDL string
 
-There is **no built-in API** to auto-generate a multi-line DDL from a `StructType`. It must be hand-written or AI-generated from `printSchema()`.
+There is **no built-in API** to generate a multi-line DDL. It must be hand-written or AI-generated from `printSchema()`.
 
 **Conversion rules:**
 
@@ -136,7 +136,7 @@ There is **no built-in API** to auto-generate a multi-line DDL from a `StructTyp
 | `StructType([...])` | `STRUCT<...>` |
 | `ArrayType(StructType([...]))` | `ARRAY<STRUCT<...>>` |
 
-**Syntax warning:** In DDL, field name and type are separated by **space**, not colon.
+**Syntax warning:** Field name and type are separated by **space**, not colon.
 - ✅ `customer_id BIGINT`
 - ❌ `customer_id: BIGINT`
 
@@ -175,98 +175,21 @@ my_schema = """
 
 ### JSON Structure Primer: Object vs. Array
 
-JSON uses two container types, and they require different handling:
+JSON uses two container types:
 
-| Symbol | Type | Example | Spark Handling |
-| :--- | :--- | :--- | :--- |
-| `{ }` | **Object** (dict) | `"customer": {"name": "John"}` | Access with `.` → `col("customer.name")` |
-| `[ ]` | **Array** (list) | `"items": [{"item_id": "I100"}, ...]` | Explode with `explode()` |
+| Symbol | Type | Spark Handling |
+| :--- | :--- | :--- |
+| `{ }` | Object (struct) | Access with `.` → `col("a.b")` |
+| `[ ]` | Array (list) | Explode with `explode()` |
+| No bracket | Scalar | Access with `col("a")` |
 
 **In this project:**
-- `customer`, `customer.address`, `payment` → **objects** (structs) → access with `.`
-- `items`, `metadata` → **arrays** → explode into separate rows
+- `customer`, `customer.address`, `payment` → structs → access with `.`
+- `items`, `metadata` → arrays → explode
 
-Recognizing the bracket type (`{` vs `[`) determines whether to use `.` or `explode()`.
+## 1.4 Transformation Workflow
 
-### Quick Rule: `{ }` vs `[ ]`
-
-When reading a JSON file, use the bracket type to decide how to handle the field:
-
-| Bracket | Meaning | Spark Handling |
-| :--- | :--- | :--- |
-| `{ }` | Object (struct) | Access nested fields with `.` → `col("a.b")` |
-| `[ ]` | Array (list) | Expand with `explode()` or `explode_outer()` |
-| No bracket | Scalar | Access directly with `col("a")` |
-
-**Rule of thumb:**
-- **Can you use `explode` on it?** → It's an array (`[...]`).
-- **Can you use `.` to drill into it?** → It's an object (`{...}`).
-
-**Applied to this project:**
-
-| Field | Bracket | Action |
-| :--- | :--- | :--- |
-| `customer` | `{...}` | `customer.name`, `customer.email`, ... |
-| `customer.address` | `{...}` | `customer.address.city`, ... |
-| `items` | `[...]` | `explode("items")` |
-| `payment` | `{...}` | `payment.method`, ... |
-| `metadata` | `[...]` | `explode("metadata")` |
-
-**Note:** In JSON, `explode` is practically always applied to arrays. Maps exist in Spark but rarely appear in raw JSON, so the rule "explode = array" is accurate for 90%+ of real-world cases.
-
----
-
-## 4. Transformation and Output
-
-### 4.1 Streaming Read (Explicit Schema Required)
-
-Unlike batch reads, `spark.readStream` **does not support automatic schema inference** in current Databricks runtimes. The config `spark.sql.streaming.schemaInference` is not available, so the schema must be provided explicitly.
-
-```python
-my_schema = """
-    order_id STRING,
-    timestamp STRING,
-    customer STRUCT<
-        customer_id BIGINT,
-        name STRING,
-        email STRING,
-        address STRUCT<
-            city STRING,
-            postal_code STRING,
-            country STRING
-        >
-    >,
-    items ARRAY<STRUCT<
-        item_id STRING,
-        product_name STRING,
-        quantity BIGINT,
-        price DOUBLE
-    >>,
-    payment STRUCT<
-        method STRING,
-        transaction_id STRING
-    >,
-    metadata ARRAY<STRUCT<
-        key STRING,
-        value STRING
-    >>
-"""
-
-df = (spark.readStream
-  .format("json")
-  .option("multiLine", True)
-  .schema(my_schema)
-  .load("/Volumes/workspace/stream/streaming/jsonsource")
-)
-```
-
-> **Note:** `spark.sql.streaming.schemaInference = true` only works in some environments. In current Databricks runtimes, this config is **not available**, so an explicit schema is mandatory.
-
-### 4.2 Transformation Workflow
-
-The transformation follows the reference tutorial: **explode both `items` and `metadata`** to fully flatten the JSON.
-
-#### Step 1: Select fields to work with
+### Step 1: Select fields
 
 ```python
 df = df.select(
@@ -277,7 +200,7 @@ df = df.select(
 )
 ```
 
-#### Step 2: Explode `items`
+### Step 2: Explode `items`
 
 ```python
 from pyspark.sql.functions import explode_outer
@@ -286,7 +209,7 @@ df = df.withColumn("items", explode_outer("items"))
 
 **Result:** 1 order → 2 rows (one per item).
 
-#### Step 3: Flatten items + nested structs
+### Step 3: Flatten items + nested structs
 
 ```python
 df = df.select(
@@ -298,7 +221,7 @@ df = df.select(
 )
 ```
 
-#### Step 4: Explode `metadata`
+### Step 4: Explode `metadata`
 
 ```python
 df = df.withColumn("metadata", explode_outer("metadata"))
@@ -307,74 +230,43 @@ df = df.select("*", "metadata.key", "metadata.value").drop("metadata")
 
 **Result:** Each previous row is multiplied by the number of metadata records. For the sample order: 2 items × 2 metadata = **4 rows**.
 
-### 4.3 Writing the Output to Delta Lake
-
-After the transformations are complete, the DataFrame is written to a Delta table using `writeStream`.
+## 1.5 Writing to Delta
 
 ```python
 df.writeStream \
     .format("delta") \
     .outputMode("append") \
     .trigger(once=True) \
-    .option("path", "/Volumes/databricks_streaming/stream/streaming/jsonsink/Data") \
-    .option("checkpointLocation", "/Volumes/databricks_streaming/stream/streaming/jsonsink/checkpoint") \
+    .option("path", "/Volumes/.../jsonsink/Data") \
+    .option("checkpointLocation", "/Volumes/.../jsonsink/checkpoint") \
     .start()
 ```
 
-#### Option Breakdown
-
 | Option | Value | Purpose |
 | :--- | :--- | :--- |
-| `format` | `"delta"` | Write as a Delta table (ACID, versioned) |
-| `outputMode` | `"append"` | Append-only; no updates or overwrites |
-| `trigger` | `once=True` | Process the current batch and stop |
-| `path` | `.../jsonsink/Data` | Target location for Delta files |
-| `checkpointLocation` | `.../jsonsink/checkpoint` | Stores stream progress and schema state |
+| `format` | `"delta"` | Delta table (ACID, versioned) |
+| `outputMode` | `"append"` | Append-only |
+| `trigger` | `once=True` | Process once, then stop |
+| `path` | `.../jsonsink/Data` | Delta output location |
+| `checkpointLocation` | `.../jsonsink/checkpoint` | Stream progress |
 
-#### Why Each Option Matters
-
-**`format("delta")`**
-- Provides ACID transactions, schema enforcement, and time travel.
-
-**`outputMode("append")`**
-- Correct mode for immutable data (no updates or deletes).
-
-**`trigger(once=True)`**
-- Batch-style execution: processes all available data once, then stops.
-
-**`checkpointLocation`**
-- **Critical for streaming.** Stores:
-  - Which files have been processed.
-  - Schema state per micro-batch.
-- **If deleted, the stream reprocesses all source files.**
-
-#### Output Structure
+**Output structure:**
 
 ```
-/Volumes/databricks_streaming/stream/streaming/jsonsink/
-├── Data/            ← Delta table files
+/Volumes/.../jsonsink/
+├── Data/            ← Delta files
 └── checkpoint/      ← Stream progress and schema state
 ```
 
-Query the output:
+Query:
 
 ```sql
-SELECT * FROM delta.`/Volumes/databricks_streaming/stream/streaming/jsonsink/Data` LIMIT 10;
+SELECT * FROM delta.`/Volumes/.../jsonsink/Data` LIMIT 10;
 ```
 
-### 4.4 Archiving Source Files
+## 1.6 Archiving Source Files
 
-`spark.readStream` does **not** maintain a checkpoint for "which files have been processed" the way Auto Loader does. To avoid reprocessing files on subsequent runs, source files are **moved out** after processing. This is called **archiving**.
-
-#### Directory Layout
-
-| Directory | Role |
-| :--- | :--- |
-| `jsonsourcenew/` | **Input** — files to be read by `readStream` |
-| `jsonsourcearchive/` | **Archive** — processed files are moved here |
-| `jsonsinknew/Data/` | **Output** — Delta table written by `writeStream` |
-
-#### Code
+`spark.readStream` does not maintain a checkpoint of processed files. To avoid reprocessing, processed files are moved to an archive directory.
 
 ```python
 df = (spark.readStream
@@ -385,69 +277,76 @@ df = (spark.readStream
   .option("sourceArchiveDir", "/Volumes/.../jsonsourcearchive")
   .load("/Volumes/.../jsonsourcenew")
 )
-
-df.writeStream \
-  .format("delta") \
-  .outputMode("append") \
-  .trigger(once=True) \
-  .option("path", "/Volumes/.../jsonsinknew/Data") \
-  .option("checkpointLocation", "/Volumes/.../jsonsinknew/checkpoint") \
-  .start()
 ```
 
 | Option | Value | Purpose |
 | :--- | :--- | :--- |
-| `cleanSource` | `"archive"` | After processing, move source files to the archive directory |
-| `sourceArchiveDir` | `.../jsonsourcearchive` | Target directory for archived files |
+| `cleanSource` | `"archive"` | Move processed files |
+| `sourceArchiveDir` | `.../jsonsourcearchive` | Archive target |
 
-#### Observed Behavior (step-by-step)
+### Observed behavior (step-by-step)
 
-| Step | Action | After Run: `jsonsourcenew/` | After Run: `jsonsourcearchive/` | After Run: `jsonsinknew/Data` |
+| Step | Action | `jsonsourcenew/` | `jsonsourcearchive/` | `jsonsinknew/Data` |
 | :--- | :--- | :--- | :--- | :--- |
-| 1 | Upload `day1`, run | day1 (not archived) | (empty) | day1 data |
-| 2 | Upload `day2`, run | day2 | day1 | day1 + day2 data |
-| 3 | Re-upload `day1`, run | day1, day2 | day1 | day1 + day2 data (with duplicates) |
-| 4 | Upload `day3`, run | day1, day3 | day1, day2 | day1 + day2 + day3 data |
+| 1 | Upload `day1`, run | day1 | (empty) | day1 data |
+| 2 | Upload `day2`, run | day2 | day1 | day1 + day2 |
+| 3 | Re-upload `day1`, run | day1, day2 | day1 | day1 + day2 (duplicates) |
+| 4 | Upload `day3`, run | day1, day3 | day1, day2 | day1 + day2 + day3 |
 | 5 | Run again (no new file) | day1, day3 | day1, day2 | (unchanged) |
 
 **Key observations:**
-- **The latest uploaded file stays in `jsonsourcenew/`** until the next new file arrives.
-- **The previous "latest" file is archived** when a newer file comes in.
-- **Re-uploading `day1`** produces duplicate rows in the output (checkpoint only tracks paths + timestamps, not content).
-- **Running again with no new file** does not change anything.
+- The latest uploaded file stays in `jsonsourcenew/` until the next new file arrives.
+- The previous "latest" file is archived.
+- Re-uploading `day1` produces duplicate rows (checkpoint tracks path + timestamp, not content).
 
-**Conclusion:** The archive mechanism follows a **"retain the latest, archive the rest"** pattern. The input directory is never fully emptied — it always holds the most recent file waiting for the next one.
+**Conclusion:** The archive mechanism follows a **"retain the latest, archive the rest"** pattern.
 
-#### Comparison: Archive vs. Auto Loader
+**Comparison:**
 
-| Approach | Prevents Reprocessing? | Schema Evolution? | Retains Latest File? |
+| Approach | Prevents Reprocessing? | Schema Evolution? | Retains Latest? |
 | :--- | :--- | :--- | :--- |
-| `readStream` + archive | ✅ (via file movement) | ❌ | ✅ |
-| Auto Loader (`cloudFiles`) | ✅ (via checkpoint) | ✅ | ❌ |
+| `readStream` + archive | ✅ | ❌ | ✅ |
+| Auto Loader (`cloudFiles`) | ✅ | ✅ | ❌ |
 
-Auto Loader is the recommended modern approach. The archive pattern is shown here for completeness, since some legacy pipelines use it.
+## 1.7 Row Multiplication from Multiple Explodes
 
-### 4.5 Output Modes
+Exploding two arrays produces a Cartesian product:
 
-`outputMode` controls how a streaming DataFrame writes its results to the sink.
+| Step | Rows (for the sample order) |
+| :--- | :--- |
+| Original | 1 |
+| After `explode(items)` | 2 |
+| After `explode(metadata)` | 4 |
+
+**In production:** 1M orders × 3 items × 4 metadata = **12M rows**.
+
+**Mitigation:**
+- Explode only the array that defines the analysis granularity (usually `items`).
+- Keep secondary arrays (e.g., `metadata`) un-exploded; process separately joined by `order_id`.
+
+This project intentionally follows the reference tutorial and explodes both arrays for demonstration.
+
+---
+
+# Part 2: Streaming Concepts (using color data)
+
+The following sections use a minimal `color` dataset (`red, green, blue, yellow, orange, maroon`) to demonstrate streaming behaviors clearly.
+
+## 2.1 Output Modes
+
+`outputMode` controls how a streaming DataFrame writes results.
 
 | Mode | Output Behavior | Destination State |
 | :--- | :--- | :--- |
-| `append` | Only new rows are written. No updates or overwrites. | Grows over time; no updates |
-| `update` | Only rows whose values changed in the latest batch are written. | Same final state as `complete` |
-| `complete` | The **entire result set** is rewritten on every batch. | Same final state as `update` |
+| `append` | Only new rows are written. | Grows over time |
+| `update` | Only rows whose values changed in the latest batch. | Same final state as `complete` |
+| `complete` | The entire result set is rewritten on every batch. | Same final state as `update` |
 
-**Key distinction:**
-- `update` and `complete` produce the **same final destination state**.
-- The difference is **what gets written per batch**:
-  - `complete` → rewrites the entire result set each time.
-  - `update` → writes only the rows that changed in the latest batch.
+**Key distinction:** `update` and `complete` produce the same final destination state; they differ in what gets written per batch.
 
-**Note:** Aggregations (`groupBy`) cannot use `append` mode — they must use `update` or `complete`.
+**Aggregations (`groupBy`) cannot use `append`.**
 
-#### Creating the Source Table
-
-A small table is used as the streaming source:
+### Source table
 
 ```sql
 CREATE TABLE IF NOT EXISTS databricks_streaming.stream.sourcetable (
@@ -455,17 +354,10 @@ CREATE TABLE IF NOT EXISTS databricks_streaming.stream.sourcetable (
 );
 
 INSERT INTO databricks_streaming.stream.sourcetable VALUES
-    ('red'),
-    ('green'),
-    ('blue'),
-    ('yellow'),
-    ('orange'),
-    ('orange');
+    ('red'), ('green'), ('blue'), ('yellow'), ('orange'), ('orange');
 ```
 
-#### Running with `complete` Mode
-
-The aggregation groups by `color` and counts occurrences:
+### `complete` mode example
 
 ```python
 df = spark.readStream.table("databricks_streaming.stream.sourcetable")
@@ -475,26 +367,20 @@ df = df.groupBy("color").agg(count("*").alias("count"))
 df.writeStream.format("delta") \
     .outputMode("complete") \
     .trigger(once=True) \
-    .option("checkpointLocation", "/Volumes/databricks_streaming/stream/streaming/output/check") \
-    .option("path", "/Volumes/databricks_streaming/stream/streaming/output/Data") \
+    .option("checkpointLocation", ".../output/check") \
+    .option("path", ".../output/Data") \
     .start()
 ```
 
-#### Simulating Multiple Batches
+### Simulating three batches
 
-To observe how `complete` mode behaves, three insert batches were applied:
-
-| Batch | Inserted | After Run: Aggregated Result |
+| Batch | Inserted | Aggregated Result |
 | :--- | :--- | :--- |
 | 1 | red, green, blue, yellow, orange, orange | red:2, green:2, blue:2, yellow:1, orange:2 |
 | 2 | red, green, blue | red:2, green:2, blue:2, yellow:1, orange:2 |
 | 3 | maroon | red:2, green:2, blue:2, yellow:1, orange:2, maroon:1 |
 
-#### Observed Result
-
-```sql
-SELECT * FROM delta.`/Volumes/databricks_streaming/stream/streaming/output/Data`;
-```
+### Observed result
 
 | color | count |
 | :--- | :--- |
@@ -505,54 +391,32 @@ SELECT * FROM delta.`/Volumes/databricks_streaming/stream/streaming/output/Data`
 | blue | 2 |
 | red | 2 |
 
-The output reflects the **full aggregated state** of the source table — confirming `complete` mode behavior.
+### Note: `update` mode not available in Free Edition
 
-#### Note: `update` Mode Not Available in Free Edition
+If available, `update` and `complete` would produce the same final state. The difference:
+- `complete` → rewrites the entire result set per batch.
+- `update` → writes only rows whose values changed in the latest batch (e.g., only `maroon:1` in the final run).
 
-The tutorial also demonstrates `update` mode, but **Databricks Free Edition does not support it**.
+## 2.2 foreachBatch: Multiple Sinks
 
-If it were available:
-- **`update` and `complete` would produce the same final destination state.**
-- The difference is **what gets written during each batch**:
-  - `complete` → rewrites the entire result set every time.
-  - `update` → writes only the rows whose values changed in the latest batch.
-
-In the final run (inserting `maroon`):
-- `complete` output: the full table (`red:2, green:2, blue:2, yellow:1, orange:2, maroon:1`).
-- `update` output (hypothetical): only `maroon:1` — the row that changed.
-
-#### Summary
-
-| Mode | Final Destination | Per-Batch Output |
-| :--- | :--- | :--- |
-| `append` | Grows over time | New rows only |
-| `update` | Full aggregated state | Only changed rows |
-| `complete` | Full aggregated state | Entire result set (rewritten) |
-
-### 4.6 foreachBatch: Multiple Sinks from One Stream
-
-`foreachBatch` allows custom logic to be applied to each micro-batch of a streaming DataFrame. It is commonly used to:
-- Write to **multiple sinks** in one pass.
-- Perform operations not supported by native streaming sinks (e.g., `MERGE`, `upsert`).
+`foreachBatch` applies custom logic to each micro-batch. Common uses:
+- Write to multiple sinks in one pass.
+- Perform `MERGE` / `upsert` (not supported by native streaming sinks).
 - Apply custom Python logic per batch.
 
-#### Full Code
-
 ```python
-# 1. Define the per-batch function
 def myfunc(df, batch_id):
     df = df.groupBy("color").agg(count("*").alias("count"))
 
     # Destination 1
     df.write.format("delta").mode("append") \
-        .option("path", ".../foreachsink/dest1").save()
+        .option("path", ".../dest1").save()
 
     # Destination 2
     df.write.format("delta").mode("append") \
-        .option("path", ".../foreachsink/dest2").save()
+        .option("path", ".../dest2").save()
 
 
-# 2. Start the stream, calling myfunc per batch
 df.writeStream.foreachBatch(myfunc) \
     .outputMode("append") \
     .trigger(once=True) \
@@ -560,52 +424,21 @@ df.writeStream.foreachBatch(myfunc) \
     .start()
 ```
 
-#### Key Points
-
 | Element | Purpose |
 | :--- | :--- |
-| `myfunc(df, batch_id)` | Custom logic for each batch |
-| `df` | The current micro-batch (not the full stream) |
-| `batch_id` | Batch sequence number (0, 1, 2, ...) |
-| `foreachBatch(myfunc)` | Applies `myfunc` to each batch |
-| `outputMode("append")` | How the outer stream feeds batches |
-| `checkpointLocation` | Required — stores stream progress |
+| `myfunc(df, batch_id)` | Custom logic per batch |
+| `df` | The current micro-batch |
+| `batch_id` | Batch sequence number |
+| `foreachBatch(myfunc)` | Apply function to each batch |
+| `checkpointLocation` | Required |
 
-#### Why Not Just Use `writeStream` Directly?
+**In the tutorial, both sinks receive identical content** — this is by design, to demonstrate the ability to write to multiple sinks in one pass. In production, sinks typically differ (hot vs. cold, detail vs. aggregate, Delta vs. Kafka).
 
-A single `writeStream` writes to **only one sink**. To write the same data to multiple destinations, use `foreachBatch`:
+## 2.3 Windowed Aggregation
 
-| Approach | Number of Sinks |
-| :--- | :--- |
-| `writeStream.format("delta").option("path", "sink1").start()` | 1 |
-| `foreachBatch` with multiple `.write` calls | 2+ |
+Streaming supports time-windowed aggregations via `window()`.
 
-#### Note: Same Content in Both Sinks (by Design)
-
-In the tutorial, `dest1` and `dest2` receive identical content because both are written from the same `df`. This is intentional for demonstration — the goal is to show that `foreachBatch` can write to **multiple sinks in one pass**.
-
-In production, the two sinks typically differ:
-- **Hot vs. cold**: Delta (for BI) + Parquet (for archival)
-- **Detail vs. aggregate**: full records + aggregated summary
-- **Different systems**: Delta + Kafka / JDBC / external APIs
-
-Example: writing a detail table and an aggregated summary:
-
-```python
-def myfunc(df, batch_id):
-    # dest1: full detail
-    df.write.format("delta").mode("append").option("path", ".../dest1").save()
-
-    # dest2: aggregated summary
-    df.groupBy("color").agg(count("*").alias("count")) \
-        .write.format("delta").mode("append").option("path", ".../dest2").save()
-```
-
-### 4.7 Windowed Aggregation
-
-Streaming supports **time-windowed aggregations** via the `window()` function. This groups events into fixed time intervals (e.g., every 10 minutes) and aggregates them per window.
-
-#### Creating the Source Table
+### Source table
 
 ```sql
 CREATE TABLE IF NOT EXISTS databricks_streaming.stream.windowtbl (
@@ -614,31 +447,22 @@ CREATE TABLE IF NOT EXISTS databricks_streaming.stream.windowtbl (
 );
 ```
 
-#### Preparing Test Data (Three Batches)
+### Test data (three batches)
 
-Events are inserted in three separate batches to simulate data arriving over time.
-
-**Batch 1:**
 ```sql
-INSERT INTO databricks_streaming.stream.windowtbl
-VALUES
+-- Batch 1
+INSERT INTO databricks_streaming.stream.windowtbl VALUES
     ('red',   '2025-01-01T11:01:00.000+00:00'),
     ('green', '2025-01-01T11:01:00.000+00:00');
-```
 
-**Batch 2:**
-```sql
-INSERT INTO databricks_streaming.stream.windowtbl
-VALUES ('green', '2025-01-01T11:07:00.000+00:00');
-```
+-- Batch 2
+INSERT INTO databricks_streaming.stream.windowtbl VALUES
+    ('green', '2025-01-01T11:07:00.000+00:00');
 
-**Batch 3:**
-```sql
-INSERT INTO databricks_streaming.stream.windowtbl
-VALUES ('green', '2025-01-01T11:12:00.000+00:00');
+-- Batch 3
+INSERT INTO databricks_streaming.stream.windowtbl VALUES
+    ('green', '2025-01-01T11:12:00.000+00:00');
 ```
-
-**Final contents of `windowtbl`:**
 
 | color | event_date |
 | :--- | :--- |
@@ -647,7 +471,7 @@ VALUES ('green', '2025-01-01T11:12:00.000+00:00');
 | green | 2025-01-01 11:07:00 |
 | green | 2025-01-01 11:12:00 |
 
-#### Windowed Aggregation Code
+### Windowed aggregation
 
 ```python
 from pyspark.sql.functions import window, count, lit
@@ -662,29 +486,12 @@ df = df.groupBy(
 df.writeStream.format("delta") \
     .outputMode("complete") \
     .trigger(once=True) \
-    .option("path", "/Volumes/databricks_streaming/stream/streaming/windows/Data") \
-    .option("checkpointLocation", "/Volumes/databricks_streaming/stream/streaming/windows/checkpoint") \
+    .option("path", ".../windows/Data") \
+    .option("checkpointLocation", ".../windows/checkpoint") \
     .start()
 ```
 
-#### How `window()` Works
-
-`window("event_date", "10 minutes")` splits the timeline into 10-minute buckets. Each event is assigned to the bucket that contains its timestamp.
-
-| Window | Time Range | Events Inside |
-| :--- | :--- | :--- |
-| Window 1 | 11:00 – 11:10 | red (11:01), green (11:01), green (11:07) |
-| Window 2 | 11:10 – 11:20 | green (11:12) |
-
-#### Why `complete` Mode?
-
-Windowed aggregations produce results that change as new events arrive. `complete` mode rewrites the full result set on each batch, ensuring the latest window state is always visible.
-
-#### Observed Result
-
-```sql
-SELECT * FROM delta.`/Volumes/databricks_streaming/stream/streaming/windows/Data`;
-```
+### Observed result
 
 | color | window | color_count |
 | :--- | :--- | :--- |
@@ -692,82 +499,54 @@ SELECT * FROM delta.`/Volumes/databricks_streaming/stream/streaming/windows/Data
 | green | 2025-01-01 11:00:00 – 11:10:00 | 2 |
 | red | 2025-01-01 11:00:00 – 11:10:00 | 1 |
 
-**Interpretation:**
-
-| Window | Events Inside | Aggregation |
+| Window | Events | Aggregation |
 | :--- | :--- | :--- |
 | 11:00 – 11:10 | red (11:01), green (11:01), green (11:07) | red: 1, green: 2 |
 | 11:10 – 11:20 | green (11:12) | green: 1 |
 
-The `window` column is a **struct** with two fields: `start` and `end`. Together they identify the window each row belongs to.
+The `window` column is a struct with `start` and `end` fields.
 
-#### Event Time vs. Processing Time
-
-Windowed aggregations use **Event Time** (the timestamp inside the data), not **Processing Time** (when Spark processes the data).
-
-| Concept | Meaning | Example |
-| :--- | :--- | :--- |
-| **Event Time** | When the event actually happened | `2025-01-01 11:07` |
-| **Processing Time** | When Spark processed the event | `2025-01-01 11:15` (arrival time) |
-
-**Why Event Time Matters:**
-- Business questions are about **when things happened**, not when they arrived.
-- Example: "Sales in the 11:00–11:10 window" should include orders placed at 11:07, even if they arrive later.
-- Using Processing Time would incorrectly bucket late-arriving data into the wrong window.
-
-Real-world data rarely arrives in Event Time order. Network delays can cause an 11:07 event to arrive at 11:15. Structured Streaming handles this via **Watermarks** — a time threshold that decides when a window can be safely closed.
-
-**In this project:** `window("event_date", "10 minutes")` uses `event_date` (Event Time) to bucket events, ensuring business-correct aggregations.
-
-#### Summary
+## 2.4 Event Time vs. Processing Time
 
 | Concept | Meaning |
 | :--- | :--- |
-| `window(col, duration)` | Split timeline into fixed intervals |
-| `groupBy("color", window(...))` | Aggregate per color per window |
-| `outputMode("complete")` | Rewrite the full window result each batch |
-| `Event Time` | The timestamp inside the data (used for bucketing) |
-| `Processing Time` | The time Spark processes the data (not used for bucketing) |
+| **Event Time** | When the event actually happened |
+| **Processing Time** | When Spark processed the event |
 
----
+**Windowed aggregations use Event Time**, not Processing Time, so that late-arriving events are still bucketed into the correct business window.
 
-## 5. Observation: Row Multiplication from Multiple Explodes
+Real-world data rarely arrives in order. Structured Streaming uses **Watermarks** to handle out-of-order data — a threshold that determines when a window can be closed.
 
-Exploding two arrays on the same DataFrame produces a Cartesian product:
+## 2.5 Window Types
 
-| Step | Rows (for the sample) |
-| :--- | :--- |
-| Original | 1 |
-| After `explode(items)` | 2 |
-| After `explode(metadata)` | 4 |
-
-**In production**, this can cause significant data expansion:
-- 1M orders × 3 items × 4 metadata = **12M rows**
-
-**Mitigation strategies:**
-- **Explode only the array that defines the analysis granularity** (usually `items`).
-- **Keep secondary arrays (e.g., `metadata`) un-exploded** and process them in a separate table joined by `order_id`.
-
-This project **intentionally follows the reference tutorial** and explodes both arrays for demonstration purposes. The row-multiplication trade-off is acknowledged as acceptable for the small sample dataset.
-
----
-
-## 6. Summary
-
-| Step | Action | Why |
+| Type | Syntax | Overlap |
 | :--- | :--- | :--- |
-| 1 | Batch read JSON | Infer structure |
-| 2 | `printSchema()` | See nesting and types |
-| 3 | Generate DDL (or reuse schema) | For streaming reader |
-| 4 | `select` top-level + nested | Prepare for explode |
-| 5 | `explode(items)` | One item per row |
-| 6 | Flatten nested into columns | Produce flat Silver table |
-| 7 | `explode(metadata)` | One key-value per row |
-| 8 | Acknowledge row multiplication | Trade-off for small data |
+| **Tumbling** | `window(col, "10 minutes")` | ❌ No overlap |
+| **Sliding** | `window(col, "10 minutes", "5 minutes")` | ✅ Overlaps by slide interval |
+| **Session** | `session_window(col, "10 minutes")` | Based on activity gaps |
+
+**Tumbling (used in this project):** Fixed 10-minute buckets, no overlap. Each event belongs to exactly one window.
+
+**Sliding:** Fixed window length, but a slide interval smaller than the window length causes overlap. Each event can belong to multiple windows. Use case: "rolling last-10-minute aggregation updated every 5 minutes."
+
+**Session:** Windows are defined by user activity gaps. A session closes after a period of inactivity. Use case: "how many pages did a user visit in one session?"
 
 ---
 
-## 7. References
+## Summary
 
-- **JSON Formatter (visual inspection):** [https://jsonformatter.org/](https://jsonformatter.org/)
+| Section | Concept |
+| :--- | :--- |
+| Part 1 | JSON ingestion, DDL, explode, archive |
+| Part 2.1 | Output modes (`append` / `update` / `complete`) |
+| Part 2.2 | `foreachBatch` for multiple sinks |
+| Part 2.3 | Windowed aggregation |
+| Part 2.4 | Event Time vs. Processing Time |
+| Part 2.5 | Tumbling / Sliding / Session windows |
+
+---
+
+## References
+
+- **JSON Formatter:** [https://jsonformatter.org/](https://jsonformatter.org/)
 - **Reference Tutorial:** [https://www.youtube.com/watch?v=r7FTCuTl84g&t=5291s](https://www.youtube.com/watch?v=r7FTCuTl84g&t=5291s)
